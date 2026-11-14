@@ -1,0 +1,10 @@
+{
+  "queries": [
+    {"row": 2, "col": 2, "level": 1},
+    {"row": 2, "col": 2, "level": 2},
+    {"row": 0, "col": 4, "level": 4},
+    {"row": 0, "col": 2, "level": 4},
+    {"row": 0, "col": 3, "level": 10000},
+    {"row": 0, "col": 0, "level": 0}
+  ]
+}

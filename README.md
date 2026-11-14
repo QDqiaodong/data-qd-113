@@ -61,6 +61,31 @@ python3 -m venv .venv
 报告逐字节等于对应单文件报告，不拼接栅格。完整口径（原子提交边界、冲突与校验规则）
 见 [docs/contract.md](docs/contract.md)。
 
+## 地形连通层级索引
+
+在既有格网上构建随水位上升的合并森林，并按原顺序回答至多 10 万条
+`(row,col,level)` 查询。水位 `h` 时仅高程 `<= h` 的格激活、按 8 邻域连通，`null`
+为障碍且不连网格外；同高程格整批处理，新盆建叶、单分量只扩张不生节点、多分量一次
+合成多叉节点，避免并列鞍部产生人为二叉链。
+
+```sh
+.venv/bin/terrain-flow connectivity \
+  --grid fixtures/terrain.json --queries queries.json --output run/connectivity.json
+```
+
+```json
+{"queries": [
+  {"row": 0, "col": 0, "level": 4},
+  {"row": 2, "col": 2, "level": -1}
+]}
+```
+
+输出含按 `(事件高程, 最小坐标)` 编号的 `forest`（每节点给出 `event_level`、
+`min_cell` 与 `children`）、森林根 `roots`，以及逐条查询的 `node_id`、面积与精确
+蓄水体积 `Σ(h-z)×格面积`；未激活或 `null` 返回 `null`。事件与查询单趟归并、并查集
+迭代实现，总时间 O((V+Q) log(V+Q))、空间 O(V+Q)，10 万格深链不递归。语义、输出字段
+与复杂度见 [docs/contract.md](docs/contract.md)。
+
 样例来源见 fixtures/DATA-SOURCES.md。代码与自制样例 MIT；没有正式题面、评测答案或内部编排代码。
 
 ## 已有能力与样例结果

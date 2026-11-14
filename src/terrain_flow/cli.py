@@ -4,8 +4,9 @@ from pathlib import Path
 from .io import publish
 from .pipeline import run
 from .lake import (BatchError, ingest, rebuild_catalog, verify_lake)
+from .connectivity import run as run_connectivity
 
-COMMANDS=('batch','verify','rebuild-catalog')
+COMMANDS=('batch','verify','rebuild-catalog','connectivity')
 
 def positive(text):
     try: value=int(text)
@@ -65,11 +66,29 @@ def rebuild(argv):
     print(json.dumps(result,ensure_ascii=False,sort_keys=True,allow_nan=False))
     return 0
 
+def connectivity(argv):
+    p=argparse.ArgumentParser(prog='terrain-flow connectivity',
+                              description='Build the rising-water merge-forest index and answer level queries.')
+    p.add_argument('--grid',type=Path,required=True,help='existing terrain JSON (cell_size_m, elevations)')
+    p.add_argument('--queries',type=Path,required=True,
+                   help='JSON document {"queries":[{"row","col","level"}, ...]}')
+    p.add_argument('--output',type=Path,required=True)
+    a=p.parse_args(argv)
+    try:
+        if a.grid.resolve()==a.output.resolve() or a.queries.resolve()==a.output.resolve():
+            raise ValueError('output must differ from the input files')
+        result=run_connectivity(a.grid,a.queries);publish(a.output,result)
+    except (ValueError,OSError,KeyError,TypeError,OverflowError,RecursionError) as e:
+        print(str(e),file=sys.stderr);return 2
+    print(json.dumps(result,ensure_ascii=False,sort_keys=True,allow_nan=False))
+    return 0
+
 def main(argv=None):
     argv=sys.argv[1:] if argv is None else list(argv)
     if argv and argv[0] in COMMANDS:
         command=argv.pop(0)
-        return {'batch':batch,'verify':verify,'rebuild-catalog':rebuild}[command](argv)
+        return {'batch':batch,'verify':verify,'rebuild-catalog':rebuild,
+                'connectivity':connectivity}[command](argv)
     return single(argv)
 
 if __name__=='__main__': raise SystemExit(main())
