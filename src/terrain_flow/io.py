@@ -1,4 +1,4 @@
-import json, math, os, tempfile
+import json, os, tempfile
 from pathlib import Path
 
 def pairs(items):
@@ -8,11 +8,16 @@ def pairs(items):
         result[k]=v
     return result
 
-def load(path):
-    raw=Path(path).read_bytes()
+def parse(raw):
     if len(raw)>8_000_000: raise ValueError('input exceeds 8 MB')
     def invalid(value): raise ValueError('non-finite JSON number: '+value)
     return json.loads(raw,object_pairs_hook=pairs,parse_constant=invalid)
+
+def load(path):
+    return parse(Path(path).read_bytes())
+
+def serialize(result):
+    return json.dumps(result,ensure_ascii=False,sort_keys=True,indent=2,allow_nan=False)+'\n'
 
 def fields(obj,names):
     if not isinstance(obj,dict) or set(obj)!=set(names.split()):
@@ -35,10 +40,11 @@ def publish(path,result):
     path=Path(path)
     if path.is_symlink(): raise ValueError('output symlink is not allowed')
     path.parent.mkdir(parents=True,exist_ok=True)
+    data=serialize(result)
     name=None
     try:
         with tempfile.NamedTemporaryFile(mode='w',encoding='utf-8',dir=path.parent,delete=False) as f:
-            name=f.name;json.dump(result,f,ensure_ascii=False,sort_keys=True,indent=2,allow_nan=False);f.write('\n')
+            name=f.name;f.write(data)
         os.replace(name,path)
     finally:
         if name and os.path.exists(name): os.unlink(name)

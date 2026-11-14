@@ -47,3 +47,111 @@ Strahler级别按河网内支流计算：无河网支流为1，仅当至少两�
 Strahler级别按高程排序后为O(K log K)，节点排序同为O(K log K)；链压缩沿边遍历，
 所有链路径长度之和恰为E，故整体O(V+K log K+E)，内存O(V+E)。未启用该参数时不
 增加任何开销。
+
+## 批次入湖（`terrain-flow batch`）
+
+单文件命令与上文语义完全不变。批次命令按显式清单读取多个独立 terrain JSON，
+逐源调用同一个 `drain` 计算，把成功报告写成不可变分区，并生成目录清单（catalog）。
+批次是逐源的独立计算，**不拼接栅格**，也不改变任何单文件报告字段。
+
+### 清单（manifest）
+
+```json
+{"sources": [
+  {"id": "alpha", "path": "a.json"},
+  {"id": "beta",  "path": "b.json", "stream_threshold": 3}
+]}
+```
+
+* 顶层必须恰为 `sources`；每项可为 `id path` 或 `id path stream_threshold`，
+  不允许其他键。`stream_threshold` 若给出必须是正整数（与单文件参数口径一致）。
+* `id` 匹配 `[A-Za-z0-9][A-Za-z0-9._-]{0,127}`，用于稳定分区路径。
+  不允许 `..`、`/`、空串，从根上排除路径穿越。
+* `path` 是相对清单所在目录的路径，解析后必须是普通文件；只允许与边界一致的文本。
+* **重复 id、重复解析后路径（含符号链接别名）、重复清单项**都是清单错误：
+  整批失败（退出2），在写入任何源之前中止。清单本身按 `io.load` 口径校验
+  （重复 JSON 键、非有限数均为错误）。
+* 清单 SHA-256 记入批次摘要，便于追溯"这一批用了哪份清单"。
+
+### 分区与原子提交边界
+
+```text
+<lake>/sources/<id>/v<N>/report.json   # 与单文件报告逐字节相同
+<lake>/sources/<id>/v<N>/meta.json    # 输入SHA、参数、产物SHA/字节数、状态
+<lake>/catalog.json                   # 目录清单（派生视图）
+```
+
+* `report.json` 就是该源在给定参数下的单文件报告（`json.dump` 同设置、带尾换行），
+  每个报告可独立解析，不拼接、不共享字段。
+* `meta.json` 记录 `format/schema_version/pipeline_version/source_id/partition_version/
+  input_sha256/params/status/artifact{path,sha256,bytes}`；`status` 恒为 `committed`。
+* **原子提交边界是"一个目录重命名"**：先在 `<lake>/.staging/` 写入完整的
+  `report.json` 与 `meta.json`（fsync），再 `os.rename` 到 `sources/<id>/v<N>`，
+  且仅当目标不存在时提交。因此可见的 `vN` 目录永远同时具备完整产物与元数据；
+  中断最多留下 `.staging` 下的残片，绝不会出现"显示成功但产物不完整"的分区。
+* 已存在的 `vN` 目录绝不会被覆盖或删除。规划与提交之间若出现目标冲突（重命名失败），
+  仅该源失败并保留旧分区；后续批次换新版本号继续。
+* 并发：与既有单文件口径一致，不承诺跨进程在线并发发布；同一湖同一时间应有单一发布者。
+
+### 幂等与版本
+
+成功源的最新版本若与本次 **输入 SHA-256、参数、`pipeline_version` 全部相同** 则跳过，
+不重算、不写入（摘要记 `skipped`，版本号不变）。任一变化——输入字节、`stream_threshold`
+（含 `null` 与整数之间的切换）或管线版本——都提交一个**新版本** `max+1`，
+旧版本原样保留，catalog 同时列出新旧，形成可追溯谱系。
+
+`pipeline_version` 是显式常数：当计算实现变化而输入参数不变时，开发者提升它，
+从而让需要重算的源生成新版本而不是被误判为"未变化"。
+
+### 失败隔离与续跑
+
+* 源级失败（缺失/不可读文件、坏 JSON、非法格网、计算异常、目标冲突）被隔离：
+  该源记为 `failed`，**其余源继续**，且不为失败源建立任何分区。
+* 批次摘要是逐次尝试的记录，含每个源的 `status`（committed/skipped/failed）、
+  版本、输入 SHA、参数、产物 SHA 与错误文本；`failed>0` 时退出码为 1。
+  修复输入后重跑：未变化源仍 `skipped`，仅未成功源提交，**不会把失败误报为完成**。
+* 清单错误与湖完整性问题（见下）是整批错误，在写入前中止（退出2）。
+* 失败源在摘要中保留 `input_sha256`（若字节可读），便于对照"失败的是哪份输入"。
+
+### 目录清单（catalog）
+
+`catalog.json` 只描述**已提交内容**，不含逐次尝试的失败：
+
+```json
+{"format": "terrain-flow-lake-catalog", "schema_version": 1,
+ "partitions": [
+   {"source_id": "alpha", "partition_version": 1,
+    "partition": "sources/alpha/v1", "input_sha256": "...",
+    "params": {"stream_threshold": null}, "pipeline_version": 1,
+    "artifact_sha256": "...", "artifact_bytes": 1234,
+    "status": "committed"}]}
+```
+
+* 分区按 `(source_id, partition_version)` 排序，字段固定、无时间戳或主机信息，
+  因此同一湖反复重建得到**逐字节相同**的清单。
+* 每次提交后原子替换 catalog；批次开始与结束时也会修复"缺失或过期"的 catalog。
+  catalog 是派生视图，可能**落后**于分区（中断窗口），但不会**领先**（不会列出不存在的分区）。
+* `terrain-flow rebuild-catalog --lake <dir>` 从磁盘上的分区按同样口径重建；
+  任何分区元数据/产物校验失败则不写，保留旧 catalog。
+* `terrain-flow verify --lake <dir>` 只读校验：逐分区校验 `meta.json` 自洽、
+  报告字节数与 SHA、报告可解析，再核对 catalog 与磁盘分区集合一致。全部通过 exit 0，
+  否则 exit 1 并输出问题列表。
+
+### 湖的完整性与冲突处理
+
+批开始前扫描 `<lake>/sources/*/v*`，对每个可见分区校验元数据与产物摘要：
+
+* 元数据缺失/损坏、产物缺失或字节/SHA 不符、`vN` 不是普通目录 → **完整性错误**，
+  整批在写入前中止（退出2），不覆盖、不删除任何文件。需人工修复或用 `rebuild-catalog`
+  在分区完好时重建 catalog。
+* catalog 列出的分区在磁盘上不存在，或 catalog 条目与分区字节不一致 → 完整性错误。
+* catalog 仅**缺少**某些已存在分区 → 视为过期，可安全修复（磁盘为准）。
+* 不形如 `sources/<id>/v<N>` 的条目（如 `sources/scratch/`、湖根其他文件）被忽略并原样保留，
+  不参与也不被写入过程删除。
+
+### 复杂度
+
+设清单源数 S、单源有效格数 V。每源复用单文件 `drain` 的 O(V log V) 计算；
+跳过判定为一次 SHA-256（O(输入字节)）。湖扫描对每个已有分区做一次 O(产物字节) 的
+摘要校验，总计 O(分区总字节)。catalog 写入 O(分区数)。内存 O(单源报告)。
+

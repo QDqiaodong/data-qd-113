@@ -37,6 +37,30 @@ python3 -m venv .venv
 不对正在被其他进程写入的输出运行；不承诺文件系统断电恢复或在线并发发布。
 修改源码后需重新安装。`run/`、`.venv/` 与构建产物均不入 Git。
 
+## 批次入湖
+
+按显式清单把多个独立 terrain JSON 逐源入湖，每源复用上面的单文件 D8 计算，
+成功结果写成不可变分区，并生成可校验重建的目录清单：
+
+```sh
+.venv/bin/terrain-flow batch --manifest manifest.json --lake run/lake
+.venv/bin/terrain-flow verify --lake run/lake
+.venv/bin/terrain-flow rebuild-catalog --lake run/lake
+```
+
+```json
+{"sources": [
+  {"id": "alpha", "path": "fixtures/terrain.json"},
+  {"id": "beta",  "path": "fixtures/terrain-ridge.json", "stream_threshold": 2}
+]}
+```
+
+分区为 `sources/<id>/v<N>/{report.json,meta.json}`，`catalog.json` 只列已提交内容。
+内容与参数均未变化的源在重跑时跳过；任一变化形成新版本且不覆盖旧分区。
+单源失败被隔离并继续批次，`failed>0` 时退出 1；清单或湖完整性错误退出 2 且不写入。
+报告逐字节等于对应单文件报告，不拼接栅格。完整口径（原子提交边界、冲突与校验规则）
+见 [docs/contract.md](docs/contract.md)。
+
 样例来源见 fixtures/DATA-SOURCES.md。代码与自制样例 MIT；没有正式题面、评测答案或内部编排代码。
 
 ## 已有能力与样例结果
