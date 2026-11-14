@@ -23,8 +23,15 @@ python3 -m venv .venv
 
 ```sh
 .venv/bin/terrain-flow --source fixtures/terrain.json --output run/report.json
+.venv/bin/terrain-flow --source fixtures/terrain.json --output run/report.json --stream-threshold 3
 .venv/bin/python -m unittest discover -s tests -v
 ```
+
+`--stream-threshold N`（正整数，可选）在原报告追加`stream_network`；不带该参数时
+输出不变。河网只保留`upstream_cells >= N`的有效格并沿既有D8边连接，节点与极大
+有向链的编号只由坐标决定，Strahler级别按河网内支流计算，链长以
+`cell_size_m*(正交步数+对角步数*sqrt(2))`精确表达。阈值过大时返回空河网。
+结构、复杂度与边界语义见 [docs/contract.md](docs/contract.md)。
 
 输入校验或计算失败退出 2，保留原输出；JSON 通过同目录临时文件完成后替换。
 不对正在被其他进程写入的输出运行；不承诺文件系统断电恢复或在线并发发布。
