@@ -1,8 +1,8 @@
 DESCRIPTION='Strict-descent D8 drainage accumulation and catchment delineation'
 import argparse, json, sys
 from pathlib import Path
-from .io import publish
-from .pipeline import run
+from .io import publish, publish_document, write_stdout
+from .pipeline import prepare
 from .lake import (BatchError, ingest, rebuild_catalog, verify_lake)
 from .connectivity import run as run_connectivity
 
@@ -23,10 +23,12 @@ def single(argv):
     a=p.parse_args(argv)
     try:
         if a.source.resolve()==a.output.resolve(): raise ValueError('source and output must differ')
-        result=run(a.source,a.stream_threshold);publish(a.output,result)
+        analysis=prepare(a.source,a.stream_threshold)
+        document=analysis.document()
+        publish_document(a.output, document)
     except (ValueError,OSError,KeyError,TypeError,OverflowError,RecursionError) as e:
         print(str(e),file=sys.stderr);return 2
-    print(json.dumps(result,ensure_ascii=False,sort_keys=True,allow_nan=False));return 0
+    write_stdout(document);return 0
 
 def batch(argv):
     p=argparse.ArgumentParser(prog='terrain-flow batch',

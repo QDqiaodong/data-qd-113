@@ -1,5 +1,6 @@
-import json, os, tempfile
+import json, os, sys, tempfile
 from pathlib import Path
+from .streaming import Sink, TextSink, write_document
 
 def pairs(items):
     result={}
@@ -37,6 +38,7 @@ def array(v):
     return v
 
 def publish(path,result):
+    """Atomically publish a complete, already-materialised object."""
     path=Path(path)
     if path.is_symlink(): raise ValueError('output symlink is not allowed')
     path.parent.mkdir(parents=True,exist_ok=True)
@@ -48,3 +50,51 @@ def publish(path,result):
         os.replace(name,path)
     finally:
         if name and os.path.exists(name): os.unlink(name)
+
+def _open_atomic(path):
+    path=Path(path)
+    if path.is_symlink(): raise ValueError('output symlink is not allowed')
+    path.parent.mkdir(parents=True,exist_ok=True)
+    descriptor,name=tempfile.mkstemp(prefix='.tmp-',dir=path.parent)
+    return path,os.fdopen(descriptor,'wb'),name
+
+def _discard(name):
+    if name and os.path.exists(name): os.unlink(name)
+
+def publish_document(path, document):
+    """Stream one report document to ``path`` with a same-directory temp file.
+
+    The pretty report format (``indent=2``, sorted keys, UTF-8, trailing
+    newline) is byte-identical to :func:`serialize`.  The document may hold
+    :class:`terrain_flow.streaming.Records` whose arrays are generated one
+    record at a time, so neither the record list nor the report string is
+    materialised.  The visible file is replaced only after the whole document
+    has been written; on any failure the old file survives.
+    """
+    target,handle,name=_open_atomic(path)
+    try:
+        sink=Sink(handle)
+        write_document(sink,document,indent=2,newline=True)
+        handle.flush()
+        os.fsync(handle.fileno())
+        handle.close()
+        os.replace(name,target)
+    except BaseException:
+        handle.close()
+        _discard(name)
+        raise
+    return sink.bytes
+
+def stdout_sink():
+    """Byte-buffered sink for stdout, falling back to the text layer."""
+    stream=getattr(sys.stdout,'buffer',None)
+    if stream is None:
+        return TextSink(sys.stdout),None
+    return Sink(stream),stream
+
+def write_stdout(document):
+    """Print the compact stdout form of a document (one trailing newline)."""
+    sink,stream=stdout_sink()
+    write_document(sink, document, indent=None, newline=True)
+    if stream is not None: stream.flush()
+    else: sys.stdout.flush()

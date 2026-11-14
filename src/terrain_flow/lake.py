@@ -31,6 +31,13 @@ staging directory, but never a visible partition with a partial artifact: a
 is written atomically after the partition and is derived data, so it may lag
 behind the partitions but never leads them.
 
+The report itself is never held in memory: it is streamed record by record
+into the staging file while its SHA-256 and byte count are accumulated, and
+those accumulated values become the metadata.  Existing artifacts are checked
+by a chunked digest, so lake scanning also runs in bounded memory.  A failure
+while the report is being streamed removes the staging directory; the old
+partition and the catalog are left untouched.
+
 A single batch is assumed to have a single publisher, matching the existing
 single-file output contract; no cross-process locking is provided.
 """
@@ -43,8 +50,9 @@ import shutil
 import tempfile
 from pathlib import Path
 
-from .drainage import drain
+from .drainage import analyze
 from .io import fields, integer, pairs, parse, serialize, text
+from .streaming import Sink, chunked_digest, write_document
 
 # Bump when a change to the computation could alter report bytes for the same
 # input and parameters.  A bump makes every source commit a new version.
@@ -284,15 +292,21 @@ def _scan(lake, parse_reports):
             if artifact.is_symlink() or not artifact.is_file():
                 raise LakeIntegrityError('partition artifact is missing: %s' % item)
             try:
-                raw = artifact.read_bytes()
+                digest, byte_count = chunked_digest(artifact)
             except OSError as error:
                 raise LakeIntegrityError('cannot read partition artifact %s: %s'
                                          % (item, error)) from error
-            if len(raw) != meta['artifact']['bytes']:
+            # Bounded chunked digest: no report-sized buffer is held here.
+            if byte_count != meta['artifact']['bytes']:
                 raise LakeIntegrityError('partition artifact size mismatch: %s' % item)
-            if _digest(raw) != meta['artifact']['sha256']:
+            if digest != meta['artifact']['sha256']:
                 raise LakeIntegrityError('partition artifact digest mismatch: %s' % item)
             if parse_reports:
+                try:
+                    raw = artifact.read_bytes()
+                except OSError as error:
+                    raise LakeIntegrityError('cannot read partition artifact %s: %s'
+                                             % (item, error)) from error
                 try:
                     report = _artifact_json(raw)
                 except ValueError as error:
@@ -300,6 +314,7 @@ def _scan(lake, parse_reports):
                                              % (item, error)) from error
                 if not isinstance(report, dict):
                     raise LakeIntegrityError('partition report is not a JSON object: %s' % item)
+                del raw
             partitions[(source_id, version)] = _catalog_entry(meta)
     return partitions
 
@@ -429,12 +444,15 @@ def _rename(source, destination):
     os.rename(source, destination)
 
 
-def _commit(lake, source_id, version, report_bytes, meta):
+def _commit(lake, source_id, version, write_report, meta):
     """Publish a partition with a single directory rename.
 
-    Returns the catalog entry for the newly visible partition.  The staging
-    directory is created outside ``sources/`` so a partial write can never be
-    mistaken for a committed partition.
+    ``write_report(handle)`` streams the report bytes into the staging file
+    and returns ``(sha256, byte_count)``; the bytes are accumulated while
+    writing, so no report-sized buffer is ever held.  Returns the catalog
+    entry for the newly visible partition.  The staging directory is created
+    outside ``sources/`` so a partial write can never be mistaken for a
+    committed partition.
     """
     sources = Path(lake) / 'sources'
     source_dir = sources / source_id
@@ -448,7 +466,14 @@ def _commit(lake, source_id, version, report_bytes, meta):
     staging.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix='commit-', dir=staging))
     try:
-        _write_synced(temporary / 'report.json', report_bytes)
+        descriptor, report_name = tempfile.mkstemp(prefix='report-', dir=temporary)
+        with os.fdopen(descriptor, 'wb') as handle:
+            digest, byte_count = write_report(handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(report_name, temporary / 'report.json')
+        meta['artifact']['sha256'] = digest
+        meta['artifact']['bytes'] = byte_count
         _write_synced(temporary / 'meta.json', serialize(meta).encode('utf-8'))
         _rename(temporary, destination)
     except BaseException:
@@ -523,8 +548,11 @@ def ingest(manifest_path, lake_path):
             if reusable:
                 results.append(_result(current, params, 'skipped'))
                 continue
-            report = drain(parse(raw), params['stream_threshold'])
-            report_bytes = serialize(report).encode('utf-8')
+            data = parse(raw)
+            del raw
+            analysis = analyze(data, params['stream_threshold'])
+            del data
+            document = analysis.document()
             version = max(versions) + 1 if versions else 1
             meta = {'format': META_FORMAT, 'schema_version': META_VERSION,
                     'pipeline_version': PIPELINE_VERSION,
@@ -532,9 +560,15 @@ def ingest(manifest_path, lake_path):
                     'input_sha256': digest, 'params': params,
                     'status': 'committed',
                     'artifact': {'path': 'report.json',
-                                 'sha256': _digest(report_bytes),
-                                 'bytes': len(report_bytes)}}
-            committed = _commit(lake, source_id, version, report_bytes, meta)
+                                 'sha256': None, 'bytes': None}}
+
+            def write_report(handle):
+                sink = Sink(handle, hashlib.sha256())
+                write_document(sink, document, indent=2, newline=True)
+                return sink.digest_value(), sink.bytes
+
+            committed = _commit(lake, source_id, version, write_report, meta)
+            del document, analysis
             partitions[(source_id, version)] = committed
             results.append(_result(committed, params, 'committed'))
             changed = True
